@@ -9,6 +9,7 @@ import threading
 from contextlib import closing
 from wsgiref.simple_server import make_server
 
+from prometheus_client.serialization.formatter import Formatter
 from . import core
 try:
     from BaseHTTPServer import BaseHTTPRequestHandler
@@ -36,12 +37,13 @@ def make_wsgi_app(registry=core.REGISTRY):
         r = registry
         if 'name[]' in params:
             r = r.restricted_registry(params['name[]'])
-        output = generate_latest(r)
+        formatter = Formatter.getformatter()
+        data = formatter.marshall(registry)
 
         status = str('200 OK')
         headers = [(str('Content-type'), CONTENT_TYPE_LATEST)]
         start_response(status, headers)
-        return [output]
+        return [data]
     return prometheus_app
 
 
@@ -56,23 +58,7 @@ def start_wsgi_server(port, addr='', registry=core.REGISTRY):
     t.start()
 
 
-def generate_latest(registry=core.REGISTRY):
-    '''Returns the metrics from the registry in latest text format as a string.'''
-    output = []
-    for metric in registry.collect():
-        output.append('# HELP {0} {1}'.format(
-            metric.name, metric.documentation.replace('\\', r'\\').replace('\n', r'\n')))
-        output.append('\n# TYPE {0} {1}\n'.format(metric.name, metric.type))
-        for name, labels, value in metric.samples:
-            if labels:
-                labelstr = '{{{0}}}'.format(','.join(
-                    ['{0}="{1}"'.format(
-                     k, v.replace('\\', r'\\').replace('\n', r'\n').replace('"', r'\"'))
-                     for k, v in sorted(labels.items())]))
-            else:
-                labelstr = ''
-            output.append('{0}{1} {2}\n'.format(name, labelstr, core._floatToGoString(value)))
-    return ''.join(output).encode('utf-8')
+
 
 
 class MetricsHandler(BaseHTTPRequestHandler):
@@ -82,12 +68,15 @@ class MetricsHandler(BaseHTTPRequestHandler):
         if 'name[]' in params:
             registry = registry.restricted_registry(params['name[]'])
         try:
-            output = generate_latest(registry)
+            formatter = Formatter.getformatter(self.headers)(False)
+
+            output = formatter.marshall(registry)
         except:
             self.send_error(500, 'error generating metric output')
             raise
         self.send_response(200)
-        self.send_header('Content-Type', CONTENT_TYPE_LATEST)
+        for k, v in formatter.get_headers().items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(output)
 
@@ -113,7 +102,9 @@ def write_to_textfile(path, registry):
     The path must end in .prom for the textfile collector to process it.'''
     tmppath = '%s.%s.%s' % (path, os.getpid(), threading.current_thread().ident)
     with open(tmppath, 'wb') as f:
-        f.write(generate_latest(registry))
+        formatter = Formatter.getformatter()
+        data = formatter.marshall(registry)
+        f.write(data)
     # rename(2) is atomic.
     os.rename(tmppath, path)
 
@@ -153,6 +144,13 @@ def pushadd_to_gateway(gateway, job, registry, grouping_key=None, timeout=None):
     This uses the POST HTTP method.'''
     _use_gateway('POST', gateway, job, registry, grouping_key, timeout)
 
+def generate_latest(registry=core.REGISTRY):
+    ''' Return metrics formatted with the default formatter for compatibility reasons.
+    `registry` is an instance of CollectorRegistry
+
+    '''
+    formatter = Formatter.getdefaultFormatter()()
+    return formatter.marshall(registry)
 
 def delete_from_gateway(gateway, job, grouping_key=None, timeout=None):
     '''Delete metrics from the given pushgateway.
@@ -178,7 +176,8 @@ def _use_gateway(method, gateway, job, registry, grouping_key, timeout):
 
     data = b''
     if method != 'DELETE':
-        data = generate_latest(registry)
+        formatter = Formatter.getdefaultFormatter()()
+        data = formatter.marshall(registry)
 
     if grouping_key is None:
         grouping_key = {}
