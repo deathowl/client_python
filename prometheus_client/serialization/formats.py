@@ -17,31 +17,7 @@ class PrometheusFormat(object):
         pass
 
     @abstractmethod
-    def _format_counter(self, counter, name):
-        """ Returns a representation of a counter value in the implemented
-            format. Receives a tuple with the labels (a dict) as first element
-            and the value as a second element
-        """
-        pass
-
-    @abstractmethod
-    def _format_gauge(self, gauge, name):
-        """ Returns a representation of a gauge value in the implemented
-            format. Receives a tuple with the labels (a dict) as first element
-            and the value as a second element
-        """
-        pass
-
-    @abstractmethod
-    def _format_summary(self, summary, name):
-        """ Returns a representation of a summary value in the implemented
-            format. Receives a tuple with the labels (a dict) as first element
-            and the value as a second element
-        """
-        pass
-
-    @abstractmethod
-    def marshall(self, registry):
+    def marshall(self, registry=REGISTRY):
         """ Marshalls a registry and returns the storage/transfer format """
         pass
 
@@ -59,12 +35,6 @@ class TextFormat(PrometheusFormat):
     LABEL_SEPARATOR_FMT = ","
     LINE_SEPARATOR_FMT = "\n"
     COUNTER_FMT = "{name}{labels} {value}"
-    GAUGE_FMT = COUNTER_FMT
-    SUMMARY_FMTS = {
-        'quantile': "{name}{labels} {value}",
-        'sum': "{name}_sum{labels} {value}",
-        'count': "{name}_count{labels} {value}",
-    }
 
 
     def get_headers(self):
@@ -95,15 +65,6 @@ class TextFormat(PrometheusFormat):
 
         return result.strip()
 
-
-    def _format_counter(self, counter, name, const_labels):
-        pass
-
-    def _format_gauge(self, gauge, name, const_labels):
-        pass
-
-    def _format_summary(self, summary, name, const_labels):
-        pass
 
     def marshall_lines(self, collector):
         """ Marshalls a collector and returns the storage/transfer format in
@@ -167,86 +128,93 @@ class ProtobufFormat(PrometheusFormat):
         return headers
 
     def _create_pb2_labels(self, labels):
-        result = []
-        for k, v in labels.items():
-            l = metrics_pb2.LabelPair(name=k, value=str(v))
-            result.append(l)
-        return result
+        return [metrics_pb2.LabelPair(name=k, value=str(v)) for k,v in labels]
 
-    def _format_counter(self, counter, name, const_labels):
-        labels = utils.format_labels(counter[0])
+    def _format_regular(self, collector, metric_type, pb_class):
+        metrics = []
+        for name, labels, value in collector.samples:
+            labels = utils.format_labels(labels)
+            pb2_labels = self._create_pb2_labels(labels)
+            measurement = pb_class(value=value)
+            metric = metrics_pb2.Metric(label=pb2_labels, **{collector.type: measurement})
+            metrics.append(metric)
 
-        # With a counter and labelpairs we do a Metric
-        pb2_labels = self._create_pb2_labels(labels)
-        counter = metrics_pb2.Counter(value=counter[1])
+        return metrics_pb2.MetricFamily(name=collector.name,
+                                                 help=collector.documentation,
+                                                 type=metric_type,
+                                                 metric=metrics)
 
-        metric = metrics_pb2.Metric(label=pb2_labels, counter=counter)
+    def _format_histogram(self, collector, metric_type, pb_class):
+        buckets = []
+        sample_count = 0
+        sample_sum = 0
+        pb2_labels = []
+        for name, labels, value in collector.samples:
+            if name.endswith("_bucket"):
+                bucket_limit = labels.get('le')
+                del labels['le']
+                labels = utils.format_labels(labels)
+                buck = metrics_pb2.Bucket(upper_bound=float(bucket_limit), cumulative_count=long(value))
+                buckets.append(buck)
+            if name.endswith('_count'):
+                sample_count = long(value)
+            if name.endswith('_sum'):
+                sample_sum = long(value)
+                pb2_labels = self._create_pb2_labels(labels)
+        measurement = metrics_pb2.Histogram(bucket=buckets, sample_count=sample_count, sample_sum=sample_sum)
 
-        return metric
+        metric = metrics_pb2.Metric(label=pb2_labels, **{collector.type: measurement})
 
-    def _format_gauge(self, gauge, name, const_labels):
-        labels = utils.format_labels(gauge[0])
 
-        pb2_labels = self._create_pb2_labels(labels)
-        gauge = metrics_pb2.Gauge(value=gauge[1])
+        return metrics_pb2.MetricFamily(name=collector.name,
+                                    help=collector.documentation,
+                                    type=metric_type,
+                                    metric=[metric])
 
-        metric = metrics_pb2.Metric(label=pb2_labels, gauge=gauge)
-        return metric
+    def _format_summary(self, collector, metric_type, pb_class):
+        for name, labels, value in collector.samples:
+            if name.endswith('_count'):
+                sample_count = long(value)
+            if name.endswith('_sum'):
+                sample_sum = long(value)
+                pb2_labels = self._create_pb2_labels(labels)
+        measurement = metrics_pb2.Summary(sample_count=sample_count, sample_sum=sample_sum)
+        metric = metrics_pb2.Metric(label=pb2_labels, **{collector.type: measurement})
 
-    def _format_summary(self, summary, name, const_labels):
-        labels = utils.format_labels(summary[0])
-
-        pb2_labels = self._create_pb2_labels(labels)
-
-        # Create the quantiles
-        quantiles = []
-
-        for k, v in summary[1].items():
-            if not isinstance(k, str):
-                q = metrics_pb2.Quantile(quantile=k, value=v)
-                quantiles.append(q)
-
-        summary = metrics_pb2.Summary(sample_count=summary[1]['count'],
-                                      sample_sum=summary[1]['sum'],
-                                      quantile=quantiles)
-
-        metric = metrics_pb2.Metric(label=pb2_labels, summary=summary)
-
-        return metric
+        return metrics_pb2.MetricFamily(name=collector.name,
+                                            help=collector.documentation,
+                                            type=metric_type,
+                                            metric=[metric])
 
     def marshall_collector(self, collector):
-
-        if isinstance(collector, Counter):
+        meth = self._format_regular
+        if collector.type == "counter":
             metric_type = metrics_pb2.COUNTER
-            exec_method = self._format_counter
-        elif isinstance(collector, Gauge):
+            pb_class = metrics_pb2.Counter
+        elif collector.type == "gauge":
             metric_type = metrics_pb2.GAUGE
-            exec_method = self._format_gauge
-        elif isinstance(collector, Summary):
+            pb_class = metrics_pb2.Gauge
+        elif collector.type == "summary":
+            meth = self._format_summary
             metric_type = metrics_pb2.SUMMARY
-            exec_method = self._format_summary
+            pb_class = metrics_pb2.Summary
+        elif collector.type == "histogram":
+            meth = self._format_histogram
+            metric_type = metrics_pb2.HISTOGRAM
+            pb_class = metrics_pb2.Histogram
         else:
             raise TypeError("Not a valid object format")
 
-        metrics = []
+        return meth(collector, metric_type, pb_class)
 
-        for i in collector.get_all():
-            r = exec_method(i, collector.name, collector.const_labels)
-            metrics.append(r)
 
-        pb2_collector = metrics_pb2.MetricFamily(name=collector.name,
-                                                 help=collector.help_text,
-                                                 type=metric_type,
-                                                 metric=metrics)
-        return pb2_collector
-
-    def marshall(self, registry):
+    def marshall(self, registry=REGISTRY):
         """Returns bytes"""
         result = b""
 
-        for i in registry.get_all():
+        for i in registry.collect():
             # Each message needs to be prefixed with a varint with the size of
-            # the message (MetrycType)
+            # the message (MetricType)
             # https://github.com/matttproud/golang_protobuf_extensions/blob/master/ext/encode.go
             # http://zombietetris.de/blog/building-your-own-writedelimitedto-for-python-protobuf/
             body = self.marshall_collector(i).SerializeToString()
@@ -261,10 +229,10 @@ class ProtobufTextFormat(ProtobufFormat):
 
     ENCODING = 'test'
 
-    def marshall(self, registry):
+    def marshall(self, registry=REGISTRY):
         blocks = []
 
-        for i in registry.get_all():
+        for i in registry.collect():
             blocks.append(str(self.marshall_collector(i)))
 
         return self.__class__.LINE_SEPARATOR_FMT.join(blocks)
